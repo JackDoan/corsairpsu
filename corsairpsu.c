@@ -128,20 +128,32 @@ static int usb_send_recv_cmd(struct corsairpsu_data* data) {
 
 	TODO
 
-	fan mode         0x03    0x3A    TODO
-	fan pwm          0x03    0x3B    TODO
-	fan status       0x03    0x81    TODO
+	fan mode 0x03 0x3A, always reports 0x90 / 0b10010000 / Fan 1, duty cycle CMD, 1 pulse/rev
+ 		From PMBUS Spec Park II Rev 1.2 Table 12:
+ 		Mask			Desc
+ 		0b10000000		1: Fan 1 present 0: no fan
+ 		0b01000000		1: Fan 1 CMD in RPM 0: Fan 1 CMD in duty cycle
+ 		0b00110000		Fan 1 tach pulses per rev
+ 		0b00001000		1: Fan 2 present 0: no fan
+ 		0b00000100		1: Fan 2 CMD in RPM 0: Fan 2 CMD in duty cycle
+ 		0b00000011		Fan 2 tach pulses per rev
+ 		Could use this if corsair ever releases a compatible PSU with a non-1 amount of fans?
+	Vout status		 0x03	 0x7a	 always seems to report 0
+    Iout status		 0x03	 0x7b	 always seems to report 0
+    Temp status		 0x03	 0x7d	 always seems to report 0
+    Comm status		 0x03	 0x7e	 always seems to report 0xc0
+	fan status       0x03    0x81    always seems to report 0 TODO
  	"blackbox mode"	 0x03	 0xd9	 TODO what does this even do?
  	"setting reset"  0x03	 0xdd 0x01
  	determine max wattage based on model name?
- 	report status registers (temp @ 0x7d, comms @ 0x7e, fans @ 0x81)
+ 	report status registers (temp @ 0x7d, comms @ 0x7e)
 */
-static int send_recv_cmd(struct corsairpsu_data* data, u8 length, u8 opcode, u8 opdata,
-							void *result, size_t result_size) {
+static int send_recv_cmd(struct corsairpsu_data* data, u8 addr, u8 opcode, u8 opdata,
+						 void *result, size_t result_size) {
 	int ret;
 
 	memset(data->buf, 0, 64);
-	data->buf[0] = length;
+	data->buf[0] = addr;
 	data->buf[1] = opcode;
 	data->buf[2] = opdata;
 
@@ -268,7 +280,7 @@ static int corsairpsu_read(struct device *dev, enum hwmon_sensor_types type,
 							if (ret < 0) {
 								goto err;
 							}
-							*val = pmbus_linear11_to_long(reading, 0L);
+							*val = pmbus_linear11_to_long(reading, 1L);
 							break;
 						default:
 							return -EOPNOTSUPP;
@@ -564,6 +576,63 @@ err:
 	return -EOPNOTSUPP;
 }
 
+static int corsairpsu_write (struct device *dev, enum hwmon_sensor_types type,
+					 u32 attr, int channel, long val) {
+		int ret;
+		struct corsairpsu_data *data = dev_get_drvdata(dev);
+		switch (type) {
+		case hwmon_pwm:
+				switch (attr) {
+				case hwmon_pwm_input:
+						switch (channel) {
+						case 0: // fan rpm
+								if (val < 0 || val > 255)
+									return -EINVAL;
+								val = DIV_ROUND_CLOSEST(val * 100, 255); //scale 0->255 to 0->100
+								ret = send_recv_cmd(data, 0x02, 0x3b, val & 0xff, NULL, 0);
+								if (ret < 0) {
+									//todo process error responses for invalid fan setpoints
+									goto err;
+								}
+								break;
+						default:
+								return -EOPNOTSUPP;
+						}
+						break;
+				case hwmon_pwm_mode:
+					switch (channel) {
+					case 0: // fan mode
+						switch(val) {
+						case 0:
+						case 1:
+							ret = send_recv_cmd(data, 0x02, 0xF0, val & 0xff, NULL, 0);
+							if (ret < 0) {
+								goto err;
+							}
+							break;
+						default:
+							return -EINVAL;
+						}
+						break;
+					default:
+						return -EOPNOTSUPP;
+					}
+					break;
+				default:
+					return -EOPNOTSUPP;
+				}
+				break;
+		default:
+				return -EOPNOTSUPP;
+		}
+		return 0;
+err:
+		if (ret == USB_MUTEX_LOCKED_ERR) {
+				return -EINVAL;
+		}
+		return -EOPNOTSUPP;
+}
+
 static const char *corsairpsu_chip_label[] = {
 	"total uptime",
 	"uptime",
@@ -632,8 +701,9 @@ static const struct hwmon_channel_info *corsairpsu_info[] = {
 		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX,		// temp1 
 		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_MAX),		// temp2
 
-	HWMON_CHANNEL_INFO(fan,
-		HWMON_F_INPUT | HWMON_F_LABEL),		// fan rpm
+	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT | HWMON_F_LABEL), // fan rpm
+
+	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_MODE), //also for fan ctrl
 
 	HWMON_CHANNEL_INFO(in, //TODO: use RATED_MAX/MIN on kernel 5.10
 		HWMON_I_INPUT | HWMON_I_LABEL,	// voltage supply
@@ -657,13 +727,17 @@ static const struct hwmon_channel_info *corsairpsu_info[] = {
 
 static umode_t corsairpsu_is_visible(const void *rdata, enum hwmon_sensor_types type,
 										u32 attr, int channel) {
-	// read-only for everybody
+	if(type == hwmon_pwm && (attr == hwmon_pwm_input || attr == hwmon_pwm_mode)) {
+			return 0644;
+	}
+	// read-only for everybody else
 	return 0444;
 }
 
 static const struct hwmon_ops corsairpsu_hwmon_ops = {
 	.is_visible = corsairpsu_is_visible,
 	.read = corsairpsu_read,
+	.write = corsairpsu_write,
 	.read_string = corsairpsu_read_labels,
 };
 
@@ -674,7 +748,7 @@ static const struct hwmon_chip_info corsairpsu_chip_info = {
 
 // helper to read a custom attribute
 static ssize_t u32_show(struct device *dev, struct device_attribute *attr,
-						char *buf, u16 opcode) {
+						char *buf, u8 opcode) {
 	int len = 0;
 	struct corsairpsu_data *data = dev_get_drvdata(dev);
 	u32 reading;
@@ -683,6 +757,18 @@ static ssize_t u32_show(struct device *dev, struct device_attribute *attr,
 	len += sprintf(buf, "%u\n", reading);
 
 	return len;
+}
+
+// helper to write a custom attribute
+static ssize_t u8_store(struct device *dev, struct device_attribute *attr,
+						u8 opcode, u8 dat) {
+		int ret;
+		struct corsairpsu_data *data = dev_get_drvdata(dev);
+		ret = send_recv_cmd(data, 0x02, opcode, dat, NULL, 0);
+		if(ret < 0) {
+				return ret;
+		}
+		return 1;
 }
 
 // total PSU uptime in seconds
@@ -705,22 +791,23 @@ static ssize_t ocp_mode_show(struct device *dev, struct device_attribute *attr,
 							char *buf) {
 	return u32_show(dev, attr, buf, 0xD8);
 }
-static DEVICE_ATTR_RO(ocp_mode);
-
-// Fan control mode
-// 0 for hardware or 1 for software
-static ssize_t fan_control_show(struct device *dev, struct device_attribute *attr,
-								char *buf) {
-	return u32_show(dev, attr, buf, 0xF0);
+static ssize_t ocp_mode_store(struct device *dev, struct device_attribute *attr,
+								 const char *buf, size_t count) {
+		switch(buf[0]) {
+		case '1':
+		case '2':
+				return u8_store(dev, attr, 0xD8, buf[0]-'0');
+		default:
+				return 1;
+		}
 }
-static DEVICE_ATTR_RO(fan_control);
+static DEVICE_ATTR_RW(ocp_mode);
 
 // custom attributes, can be read through /sys/class/hwmon/hwmon* but not 'sensors'
 static struct attribute *corsairpsu_attrs[] = {
 	&dev_attr_total_uptime.attr,
 	&dev_attr_current_uptime.attr,
 	&dev_attr_ocp_mode.attr,
-	&dev_attr_fan_control.attr,
 	NULL
 };
 
